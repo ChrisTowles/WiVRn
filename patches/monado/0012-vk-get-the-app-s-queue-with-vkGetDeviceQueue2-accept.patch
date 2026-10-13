@@ -1,0 +1,197 @@
+From 3bf4d47057f37faf3d5d50260118fc56e88381ca Mon Sep 17 00:00:00 2001
+From: no name <git-am@invalid>
+Date: Tue, 13 Oct 2026 13:22:15 -0400
+Subject: [PATCH] vk: get the app's queue with vkGetDeviceQueue2; accept
+ timeline semaphores from VkPhysicalDeviceVulkan12Features
+
+An application may create its queue with flags (VK_KHR_internally_synchronized_queues, protected);
+vkGetDeviceQueue is invalid for such a queue (VUID-vkGetDeviceQueue-flags-01841), and
+vkGetDeviceQueue2 must be given the flags the queue was created with (VUID-VkDeviceQueueInfo2-flags-06225).
+xrCreateVulkanDeviceKHR notes each queue family's create flags for the device it creates and the
+queue is fetched with those; a device the application created itself falls back to trying each
+flag set.
+
+xrCreateVulkanDeviceKHR inserted VkPhysicalDeviceTimelineSemaphoreFeatures when the application
+enabled timeline semaphores through VkPhysicalDeviceVulkan12Features, and the two may not share a
+chain (VUID-VkDeviceCreateInfo-pNext-02830).
+---
+ src/xrt/auxiliary/vk/vk_bundle_init.c         | 75 ++++++++++++++++++-
+ src/xrt/auxiliary/vk/vk_generate_inc_files.py |  1 +
+ src/xrt/auxiliary/vk/vk_helpers.h             | 18 +++++
+ src/xrt/state_trackers/oxr/oxr_vulkan.c       | 19 ++++-
+ 4 files changed, 111 insertions(+), 2 deletions(-)
+
+diff --git a/src/xrt/auxiliary/vk/vk_bundle_init.c b/src/xrt/auxiliary/vk/vk_bundle_init.c
+index d20d2f35f..7a4201843 100644
+--- a/src/xrt/auxiliary/vk/vk_bundle_init.c
++++ b/src/xrt/auxiliary/vk/vk_bundle_init.c
+@@ -813,6 +813,42 @@ vk_reset_queues(struct vk_bundle *vk)
+ 	}
+ }
+ 
++/*
++ * Queue create flags of the devices Monado created for the application, by device and family. A
++ * session creates its device before it gets the queue, so these are written before they are read.
++ */
++#define NOTED_QUEUE_FLAGS_MAX 16
++
++static struct
++{
++	VkDevice device;
++	uint32_t family_index;
++	VkDeviceQueueCreateFlags flags;
++} noted_queue_flags[NOTED_QUEUE_FLAGS_MAX];
++static uint32_t noted_queue_flags_next;
++
++void
++vk_note_queue_create_flags(VkDevice device, uint32_t family_index, VkDeviceQueueCreateFlags flags)
++{
++	uint32_t slot = noted_queue_flags_next++ % NOTED_QUEUE_FLAGS_MAX;
++	noted_queue_flags[slot].device = device;
++	noted_queue_flags[slot].family_index = family_index;
++	noted_queue_flags[slot].flags = flags;
++}
++
++bool
++vk_noted_queue_create_flags(VkDevice device, uint32_t family_index, VkDeviceQueueCreateFlags *out_flags)
++{
++	for (uint32_t i = 0; i < NOTED_QUEUE_FLAGS_MAX; i++) {
++		if (noted_queue_flags[i].device == device && noted_queue_flags[i].family_index == family_index &&
++		    device != VK_NULL_HANDLE) {
++			*out_flags = noted_queue_flags[i].flags;
++			return true;
++		}
++	}
++	return false;
++}
++
+ static struct vk_bundle_queue *
+ vk_insert_get_queue(struct vk_bundle *vk, const struct vk_queue_pair *new_queue)
+ {
+@@ -846,7 +882,44 @@ vk_insert_get_queue(struct vk_bundle *vk, const struct vk_queue_pair *new_queue)
+ 		q->index = new_queue->index;
+ 		q->family_index = new_queue->family_index;
+ 
+-		vk->vkGetDeviceQueue(vk->device, q->family_index, q->index, &q->queue);
++		/*
++		 * The queue may have been created with flags (an application's protected or internally
++		 * synchronized queue): vkGetDeviceQueue is only valid for queues created without any,
++		 * and vkGetDeviceQueue2 returns VK_NULL_HANDLE unless the flags match. A device Monado
++		 * created (xrCreateVulkanDeviceKHR) noted its flags; otherwise try each.
++		 */
++		VkDeviceQueueCreateFlags noted;
++		if (vk_noted_queue_create_flags(vk->device, q->family_index, &noted)) {
++			const VkDeviceQueueInfo2 info = {
++			    .sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_INFO_2,
++			    .flags = noted,
++			    .queueFamilyIndex = q->family_index,
++			    .queueIndex = q->index,
++			};
++			vk->vkGetDeviceQueue2(vk->device, &info, &q->queue);
++		}
++		const VkDeviceQueueCreateFlags candidates[] = {
++		    0,
++#ifdef VK_KHR_internally_synchronized_queues
++		    VK_DEVICE_QUEUE_CREATE_INTERNALLY_SYNCHRONIZED_BIT_KHR,
++#endif
++		    VK_DEVICE_QUEUE_CREATE_PROTECTED_BIT,
++		};
++		for (uint32_t c = 0; c < ARRAY_SIZE(candidates) && q->queue == VK_NULL_HANDLE; ++c) {
++			const VkDeviceQueueInfo2 info = {
++			    .sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_INFO_2,
++			    .flags = candidates[c],
++			    .queueFamilyIndex = q->family_index,
++			    .queueIndex = q->index,
++			};
++			vk->vkGetDeviceQueue2(vk->device, &info, &q->queue);
++		}
++		if (q->queue == VK_NULL_HANDLE) {
++			VK_ERROR(vk, "failed to get queue %u of family %u", q->index, q->family_index);
++			q->index = (uint32_t)-1;
++			q->family_index = VK_QUEUE_FAMILY_IGNORED;
++			return NULL;
++		}
+ 		return q;
+ 	}
+ 
+diff --git a/src/xrt/auxiliary/vk/vk_generate_inc_files.py b/src/xrt/auxiliary/vk/vk_generate_inc_files.py
+index a75572c82..eed1f1bb7 100644
+--- a/src/xrt/auxiliary/vk/vk_generate_inc_files.py
++++ b/src/xrt/auxiliary/vk/vk_generate_inc_files.py
+@@ -114,6 +114,7 @@ def get_device_cmds():
+         Cmd("vkDestroyDescriptorSetLayout"),
+         None,
+         Cmd("vkGetDeviceQueue"),
++        Cmd("vkGetDeviceQueue2"),
+         Cmd("vkQueueSubmit"),
+         Cmd("vkQueueWaitIdle"),
+         None,
+diff --git a/src/xrt/auxiliary/vk/vk_helpers.h b/src/xrt/auxiliary/vk/vk_helpers.h
+index f14b2ddb4..2bbbaa48b 100644
+--- a/src/xrt/auxiliary/vk/vk_helpers.h
++++ b/src/xrt/auxiliary/vk/vk_helpers.h
+@@ -1370,6 +1370,24 @@ vk_convert_timestamps_to_host_ns(struct vk_bundle *vk, uint32_t count, uint64_t
+ #endif
+ 
+ 
++/*!
++ * Notes the create flags of a queue family on a device Monado created for the application, so
++ * the queue can later be fetched with matching vkGetDeviceQueue2 flags.
++ *
++ * @ingroup aux_vk
++ */
++void
++vk_note_queue_create_flags(VkDevice device, uint32_t family_index, VkDeviceQueueCreateFlags flags);
++
++/*!
++ * The flags noted by @ref vk_note_queue_create_flags, if any.
++ *
++ * @ingroup aux_vk
++ */
++bool
++vk_noted_queue_create_flags(VkDevice device, uint32_t family_index, VkDeviceQueueCreateFlags *out_flags);
++
++
+ #ifdef __cplusplus
+ }
+ #endif
+diff --git a/src/xrt/state_trackers/oxr/oxr_vulkan.c b/src/xrt/state_trackers/oxr/oxr_vulkan.c
+index 71244264e..5184c5fea 100644
+--- a/src/xrt/state_trackers/oxr/oxr_vulkan.c
++++ b/src/xrt/state_trackers/oxr/oxr_vulkan.c
+@@ -492,7 +492,18 @@ oxr_vk_create_vulkan_device(struct oxr_logger *log,
+ 		// Check if the user has already put the struct into the chain
+ 		const VkBaseInStructure *existing = vk_find_struct_in_chain(
+ 		    (VkBaseInStructure *)&modified_info, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TIMELINE_SEMAPHORE_FEATURES);
+-		if (existing != NULL) {
++		// Or the Vulkan 1.2 features struct, which carries the same feature and may not share
++		// a chain with VkPhysicalDeviceTimelineSemaphoreFeatures (VUID-VkDeviceCreateInfo-pNext-02830).
++		const VkBaseInStructure *existing_12 = vk_find_struct_in_chain(
++		    (VkBaseInStructure *)&modified_info, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES);
++		if (existing == NULL && existing_12 != NULL) {
++			const VkPhysicalDeviceVulkan12Features *features_12 =
++			    (const VkPhysicalDeviceVulkan12Features *)existing_12;
++			if (!features_12->timelineSemaphore) {
++				oxr_warn(log, "Timeline semaphores are explicitly disabled by application");
++				timeline_semaphore_info.timelineSemaphore = VK_FALSE;
++			}
++		} else if (existing != NULL) {
+ 			VkPhysicalDeviceTimelineSemaphoreFeatures *existing_timeline_semaphore_info =
+ 			    (VkPhysicalDeviceTimelineSemaphoreFeatures *)existing;
+ 			if (!existing_timeline_semaphore_info->timelineSemaphore) {
+@@ -510,6 +521,12 @@ oxr_vk_create_vulkan_device(struct oxr_logger *log,
+ #endif
+ 
+ 	*vulkanResult = loaded_CreateDevice(physical_device, &modified_info, createInfo->vulkanAllocator, vulkanDevice);
++	if (*vulkanResult == VK_SUCCESS) {
++		for (uint32_t i = 0; i < modified_info.queueCreateInfoCount; i++) {
++			const VkDeviceQueueCreateInfo *queue = &modified_info.pQueueCreateInfos[i];
++			vk_note_queue_create_flags(*vulkanDevice, queue->queueFamilyIndex, queue->flags);
++		}
++	}
+ 
+ 
+ 	// Logging
+-- 
+2.43.0
+
