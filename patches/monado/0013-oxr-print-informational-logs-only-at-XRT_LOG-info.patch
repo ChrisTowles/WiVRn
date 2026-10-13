@@ -1,0 +1,38 @@
+From e627d1f3ae747728e15ca060293e7055b24c0a5a Mon Sep 17 00:00:00 2001
+From: Patrick Towles <james.towles@gmail.com>
+Date: Tue, 13 Oct 2026 13:39:34 -0400
+Subject: [PATCH] oxr: print informational logs only at XRT_LOG=info or below
+
+oxr_log (and the sink logs it prints, such as the xrCreateInstance, xrGetSystem and Vulkan
+instance/device creation reports) printed unconditionally into every application's console.
+Gate them on the global log level like Monado's other info-level logs; warnings and errors
+are unchanged.
+---
+ src/xrt/state_trackers/oxr/oxr_logger.c | 4 +++-
+ 1 file changed, 3 insertions(+), 1 deletion(-)
+
+diff --git a/src/xrt/state_trackers/oxr/oxr_logger.c b/src/xrt/state_trackers/oxr/oxr_logger.c
+index 5e0287d65..4c2c80ae9 100644
+--- a/src/xrt/state_trackers/oxr/oxr_logger.c
++++ b/src/xrt/state_trackers/oxr/oxr_logger.c
+@@ -11,6 +11,7 @@
+ 
+ #include "util/u_misc.h"
+ #include "util/u_debug.h"
++#include "util/u_logging.h"
+ #include "util/u_truncate_printf.h"
+ 
+ #include "oxr_objects.h"
+@@ -176,7 +177,8 @@ oxr_log_set_instance(struct oxr_logger *logger, struct oxr_instance *inst)
+ void
+ oxr_log(struct oxr_logger *logger, const char *fmt, ...)
+ {
+-	if (CHECK_SHOULD_NOT_PRINT) {
++	// Informational: printed at XRT_LOG=info or more verbose, like the rest of Monado's info logs.
++	if (CHECK_SHOULD_NOT_PRINT || u_log_get_global_level() > U_LOGGING_INFO) {
+ 		return;
+ 	}
+ 
+-- 
+2.43.0
+
