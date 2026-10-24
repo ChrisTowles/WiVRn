@@ -408,7 +408,10 @@ void update_fsm()
 
 		if (not server_running)
 		{
-			runtime_setter.reset();
+			// --early-active-runtime keeps the runtime registered across sessions: an app
+			// restarted between them still finds it.
+			if (do_active_runtime)
+				runtime_setter.reset();
 
 			g_timeout_add(delay_next_try.count(), [](void *) {
 				start_listening();
